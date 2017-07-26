@@ -22,3 +22,5 @@ vendor/*
 .imdone
 # UT4 Specific
 .clientid
+# Ignore temp dir
+temp/

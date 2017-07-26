@@ -12,6 +12,14 @@ build:
 	go build -o ./bin/${APP_NAME} ./src/*.go
 
 run: build
+	PACKAGER_RELEASE_FEED_URL="http://update.donovansolms.local/temp/utfeed.rss" \
+	PACKAGER_DATABASE_HOST=127.0.0.1 \
+	PACKAGER_DATABASE_PORT=3306 \
+	PACKAGER_DATABASE_NAME=unattended \
+	PACKAGER_DATABASE_USER=root \
+	PACKAGER_DATABASE_PASSWORD=root \
+	PACKAGER_WORKING_DIR="./temp/working" \
+	PACKAGER_RELEASE_DIR="./temp" \
 	./bin/${APP_NAME}
 
 # http://golang.org/cmd/go/#hdr-Run_gofmt_on_package_sources

@@ -37,6 +37,12 @@
 			"revisionTime": "2017-01-02T12:52:26Z"
 		},
 		{
+			"checksumSHA1": "gWlw0l2wMBLhmejJCTr/Zywqyk8=",
+			"path": "github.com/kelseyhightower/envconfig",
+			"revision": "70f0258d44cbaa3b6a2581d82f58da01a38e4de4",
+			"revisionTime": "2017-05-23T19:07:22Z"
+		},
+		{
 			"checksumSHA1": "ehWoBlj+lhl4mJyE1NjgJYX4BBQ=",
 			"path": "github.com/mmcdole/gofeed",
 			"revision": "042c0a9121581210fc8ef106d8ad1b0bdf931ae2",
