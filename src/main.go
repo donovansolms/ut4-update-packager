@@ -8,6 +8,7 @@ import (
 	"github.com/kelseyhightower/envconfig"
 )
 
+// Config holds the configuration information from env vars
 type Config struct {
 	ReleaseFeedURL   string `split_words:"true"`
 	ReleaseDir       string `split_words:"true"`
@@ -20,8 +21,6 @@ type Config struct {
 }
 
 func main() {
-	fmt.Println("Testing")
-
 	var config Config
 	err := envconfig.Process("packager", &config)
 	if err != nil {
@@ -39,8 +38,12 @@ func main() {
 		config.ReleaseFeedURL,
 		connectionString,
 		config.WorkingDir,
+		config.ReleaseDir,
 	)
 
-	packager.Run()
-
+	// TODO: Remove later
+	err = packager.Run()
+	if err != nil {
+		panic(err)
+	}
 }

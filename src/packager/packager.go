@@ -2,30 +2,25 @@ package packager
 
 import (
 	"archive/zip"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/donovansolms/ut4-update-packager/src/packager/models"
+	"github.com/jinzhu/gorm"
 	"github.com/mmcdole/gofeed"
 	"github.com/mvdan/xurls"
 	log "github.com/sirupsen/logrus"
-
-	// This is how SQL drivers are imported
-	_ "github.com/go-sql-driver/mysql"
-	"github.com/jinzhu/gorm"
 )
 
-// Packager handlers packaging operations
+// Packager creates new update packages for releases
 type Packager struct {
 	// releaseFeedUrl is the feed where new releases are announced
 	releaseFeedURL string
@@ -33,12 +28,15 @@ type Packager struct {
 	connectionString string
 	// workingDir is the path for download and extract
 	workingDir string
+	// releaseDir is where the releases are stored with their version numbers
+	releaseDir string
 }
 
-// New creates a new Packager
+// New creates a new instance of Packager
 func New(releaseFeedURL string,
 	connectionString string,
-	workingDir string) *Packager {
+	workingDir string,
+	releaseDir string) *Packager {
 	log.SetOutput(os.Stdout)
 	log.SetLevel(log.DebugLevel)
 	log.SetFormatter(&log.TextFormatter{
@@ -49,34 +47,32 @@ func New(releaseFeedURL string,
 		releaseFeedURL:   releaseFeedURL,
 		connectionString: connectionString,
 		workingDir:       workingDir,
+		releaseDir:       releaseDir,
 	}
 }
 
-// Run executes the main loop to check for new releases and packages
-// the release for update
-func (packager *Packager) Run() {
-	var feed *gofeed.Feed
-	var releasePosts []*gofeed.Item
-	var db *gorm.DB
-	var newReleasePost *gofeed.Item
-
+// CheckForNewRelease checks if a new release has been announced on
+// the UT4 blog and returns the download URL if available with the download
+// size
+func (packager *Packager) CheckForNewRelease() (string, float64, error) {
+	var downloadURL string
+	var downloadSize float64
 	feed, err := packager.fetchFeed()
 	if err != nil {
-		log.WithField("err", "fetch_feed").Error(err.Error())
-		goto sleep
+		return downloadURL, downloadSize, err
 	}
 
-	releasePosts, err = packager.extractReleasePosts(feed)
+	releasePosts, err := packager.extractReleasePosts(feed)
 	if err != nil {
-		log.WithField("err", "extract_releases").Error(err.Error())
-		goto sleep
+		return downloadURL, downloadSize, err
 	}
 
-	db, err = gorm.Open("mysql", packager.connectionString)
+	db, err := gorm.Open("mysql", packager.connectionString)
 	if err != nil {
-		log.WithField("err", "db_connect").Fatal(err.Error())
+		return downloadURL, downloadSize, err
 	}
 	defer db.Close()
+	var newReleasePost *gofeed.Item
 	for _, releasePost := range releasePosts {
 		var model models.Ut4BlogPost
 		query := db.
@@ -86,131 +82,120 @@ func (packager *Packager) Run() {
 			if query.Error == gorm.ErrRecordNotFound {
 				// New blog post found
 				newReleasePost = releasePost
+			} else {
+				return downloadURL, downloadSize, query.Error
 			}
 		}
 	}
 
-	if newReleasePost != nil {
-		log.WithFields(log.Fields{
-			"title": newReleasePost.Title,
-			"guid":  newReleasePost.GUID,
-			"date":  newReleasePost.PublishedParsed.Format("2006-01-02 15:04:03"),
-		}).Info("New release post is available")
+	log.WithFields(log.Fields{
+		"title": newReleasePost.Title,
+		"guid":  newReleasePost.GUID,
+		"date":  newReleasePost.PublishedParsed.Format("2006-01-02 15:04:03"),
+	}).Info("New release post is available")
 
-		// TODO: Send email
+	// TODO: Send email
 
-		downloadURL, err := packager.extractUpdateDownloadLinkFromPost(newReleasePost)
-		if err != nil {
-			log.WithField("err", "extract_download_link").Error(err.Error())
-			goto sleep
-		}
-		downloadSize, err := packager.getDownloadSize(downloadURL)
-		if err != nil {
-			log.WithField("err", "get_download_size").Error(err.Error())
-			goto sleep
-		}
-		log.WithFields(log.Fields{
-			"link": downloadURL,
-			"size": fmt.Sprintf("%.2fMB", (downloadSize / 1024.00 / 1024.00)),
-		}).Info("Release download link found, downloading...")
-
-		downloadFilePath := filepath.Join(packager.workingDir, "ut4-dl.zip")
-		err = packager.downloadFile(downloadFilePath, downloadURL)
-		if err != nil {
-			log.WithField("err", "download").Error(err.Error())
-			goto sleep
-		}
-		log.WithFields(log.Fields{
-			"output": downloadFilePath,
-		}).Info("Downloaded")
-
-		// Extract the files
-		extractPath := filepath.Join(packager.workingDir, "ut4extract")
-		err = packager.extract(extractPath, downloadFilePath)
-		if err != nil {
-			log.WithField("err", "extract").Error(err.Error())
-			goto sleep
-		}
-		// Generate hashes for all the files in the extractPath
-		hashes, err := packager.generateHashes(extractPath)
-		if err != nil {
-			log.WithField("err", "hash").Error(err.Error())
-			goto sleep
-		}
-		_ = hashes
-
-		newVersion, err := packager.getReleaseNumber(extractPath)
-		if err != nil {
-			// TODO: Possibly check the download file name for the version number
-			// TODO: Send email with missing release number
-			log.WithField("err", "missing_release_version").Error(err.Error())
-			os.Exit(1)
-		}
-
-		// Select the last version's hashes which is not this version
-		var previousHashVersion models.Ut4VersionHashes
-		query := db.
-			Where("version != ? AND is_deleted = 0", newVersion).
-			Order("version DESC").
-			First(&previousHashVersion)
-		if query.Error != nil {
-			if query.Error == gorm.ErrRecordNotFound {
-				// TODO: No previous versions exist, this is then the update package
-			}
-			log.WithField("err", "no_previous_hashes").Error(query.Error.Error())
-			goto sleep
-		}
-
-		previousHashes := make(map[string]string)
-		err = json.Unmarshal([]byte(previousHashVersion.Hashes), &previousHashes)
-		if err != nil {
-			// TODO: Send email or something?
-			log.WithField("err", "previous_hash_unmarshal").Error(err.Error())
-			goto sleep
-		}
-		// Calculate the delta between the two versions
-		delta := packager.calculateHashDeltaOperations(previousHashes, hashes)
-		if len(delta) == 0 {
-			// Nothing changed?
-			// TODO: Log this as a new version to avoid downloading again
-			log.WithField("err", "no_changes").Error(err.Error())
-			goto sleep
-		}
-
-		// Create a new distribution dir for the package
-		upgradePackagePath := filepath.Join(packager.workingDir, newVersion)
-		err = os.RemoveAll(upgradePackagePath)
-		if err != nil {
-			log.WithField("err", "pre_remove_upgrade_path").Error(err.Error())
-			goto sleep
-		}
-		// Then move everything that was added or modified
-		upgradeFileCount, byteCount, err := packager.createUpgradeDelta(
-			delta, extractPath, upgradePackagePath)
-		if err != nil {
-			log.WithField("err", "create_upgrade_delta").Error(err.Error())
-			goto sleep
-		}
-		log.WithFields(log.Fields{
-			"count": upgradeFileCount,
-			"size":  fmt.Sprintf("%.2fMB", (float64(byteCount) / 1024.00 / 1024.00)),
-		}).Info("Upgrade package files created")
-
-		// Generate new upgrade hash from delta
-		deltaHash := packager.generateDeltaHash(delta)
-		log.WithField("hash", deltaHash).Info("Delta upgrade hash generated")
-
-		// TODO: Package new version to tar.gz
-
-		// TODO: Upload upgrade package to cloud storage
-		// TODO: Insert new version to database
-		// TODO: remove extractPath and all working files
+	downloadURL, err = packager.extractUpdateDownloadLinkFromPost(newReleasePost)
+	if err != nil {
+		return downloadURL, downloadSize, err
+	}
+	downloadSize, err = packager.getDownloadSize(downloadURL)
+	if err != nil {
+		return downloadURL, downloadSize, err
 	}
 
-sleep:
-	// TODO: Increase
-	db.Close()
-	time.Sleep(time.Second * 1)
+	return downloadURL, downloadSize, nil
+}
+
+// DownloadAndExtract downloads and extracts the release from downloadLink
+// and returns the extracted path
+func (packager *Packager) DownloadAndExtract(downloadURL string) (string, error) {
+	// Download the new release
+	downloadFilePath := filepath.Join(packager.workingDir, "newrelease.zip")
+	err := packager.downloadFile(downloadFilePath, downloadURL)
+	if err != nil {
+		return "", err
+	}
+	log.WithFields(log.Fields{
+		"output": downloadFilePath,
+	}).Info("Downloaded")
+
+	// Extract the files to be able to determine the version
+	extractPath := filepath.Join(packager.workingDir, "newrelease")
+	err = packager.extract(extractPath, downloadFilePath)
+	if err != nil {
+		return "", err
+	}
+	return extractPath, nil
+}
+
+// GetVersionList returns the available installed versions as a list
+func (packager *Packager) GetVersionList() ([]string, error) {
+	fileInfo, err := os.Stat(packager.releaseDir)
+	if err != nil {
+		return nil, err
+	}
+	if fileInfo.IsDir() == false {
+		return nil, errors.New("The install path must be a directory")
+	}
+
+	files, err := ioutil.ReadDir(packager.releaseDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var versions []string
+	for _, file := range files {
+		if file.IsDir() {
+			versions = append(versions, file.Name())
+		}
+	}
+	return versions, nil
+}
+
+// Run executes a continuous loop that checks for updates and packages
+// new updates as they become available
+func (packager *Packager) Run() error {
+	// Is a new release available from the blog?
+	downloadURL, downloadSize, err := packager.CheckForNewRelease()
+	if err != nil {
+		log.WithField("err", "check_for_release").Error(err.Error())
+		return err
+	}
+	log.WithFields(log.Fields{
+		"link": downloadURL,
+		"size": fmt.Sprintf("%.2fMB", (downloadSize / 1024.00 / 1024.00)),
+	}).Info("New release is available")
+
+	// Get the new release
+	newReleasePath, err := packager.DownloadAndExtract(downloadURL)
+	if err != nil {
+		log.WithField("err", "download_extract").Error(err.Error())
+		return err
+	}
+	log.WithFields(log.Fields{
+		"output": newReleasePath,
+	}).Info("Release downloaded and extracted")
+
+	// Determine version
+	newVersion, err := packager.getReleaseNumber(newReleasePath)
+	if err != nil {
+		// TODO: Possibly check the download file name for the version number
+		// TODO: Send email with missing release number
+		log.WithField("err", "missing_release_version").Error(err.Error())
+		return err
+	}
+	log.WithField("version", newVersion).Info("Version info found")
+
+	versions, err := packager.GetVersionList()
+	if err != nil {
+		log.WithField("err", "version_list").Error(err.Error())
+		return err
+	}
+	log.WithField("versions", versions).Info("Currently available versions")
+
+	return nil
 }
 
 // fetchFeed fetches the content from the release feed
@@ -301,10 +286,16 @@ func (packager *Packager) downloadFile(
 	defer output.Close()
 
 	resp, err := http.Get(downloadLink)
+	fmt.Println(downloadLink)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf(
+			"DownloadURL returned %s",
+			resp.Status)
+	}
 	_, err = io.Copy(output, resp.Body)
 	if err != nil {
 		return err
@@ -353,51 +344,6 @@ func (packager *Packager) extract(extractPath string, zipPath string) error {
 	return nil
 }
 
-// generateHashes generates SHA256 hashes for all the files in fileList
-func (packager *Packager) generateHashes(
-	searchPath string) (map[string]string, error) {
-
-	hashes := make(map[string]string)
-	var fileList []string
-	err := filepath.Walk(
-		searchPath,
-		func(path string, fileInfo os.FileInfo, err error) error {
-			if fileInfo.IsDir() == false {
-				fileList = append(fileList, path)
-			}
-			return nil
-		})
-	if err != nil {
-		return hashes, err
-	}
-
-	// Queue jobs!
-	for _, filepath := range fileList {
-		fileInfo, err := os.Stat(filepath)
-		if err != nil {
-			return hashes, err
-		}
-		usePath := strings.Replace(filepath, searchPath+"/", "", -1)
-		if fileInfo.Size() == 0 {
-			hashes[usePath] = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-			continue
-		}
-		file, err := os.Open(filepath)
-		if err != nil {
-			return hashes, err
-		}
-		defer file.Close()
-		// Set up an internal hash progress tracker
-		hasher := sha256.New()
-		_, err = io.Copy(hasher, file)
-		if err != nil {
-			return hashes, err
-		}
-		hashes[usePath] = fmt.Sprintf("%x", hasher.Sum(nil))
-	}
-	return hashes, nil
-}
-
 // getReleaseNumber extracts the release version from an UT4 install path
 func (packager *Packager) getReleaseNumber(installPath string) (string, error) {
 	moduleFile, err := os.Open(
@@ -409,93 +355,10 @@ func (packager *Packager) getReleaseNumber(installPath string) (string, error) {
 	}
 	defer moduleFile.Close()
 
-	var module UT4Modules
+	var module OldUT4Modules
 	err = json.NewDecoder(moduleFile).Decode(&module)
 	if err != nil {
 		return "", err
 	}
 	return strconv.Itoa(module.Changelist), nil
-}
-
-// calculateHashDeltaOperations calculates the operations to be performed
-// between two versions
-func (packager *Packager) calculateHashDeltaOperations(
-	current map[string]string,
-	next map[string]string) map[string]string {
-
-	// This will determine what needs to be done to current
-	// Modified, Removed will be done first,
-	// Added in pass 2
-	delta := make(map[string]string)
-	for file, hash := range current {
-		if nextHash, ok := next[file]; ok {
-			if nextHash != hash {
-				// File has been modified
-				delta[file] = "modified"
-			}
-		} else {
-			// File has been removed
-			delta[file] = "removed"
-		}
-	}
-	for file := range next {
-		if _, ok := current[file]; !ok {
-			delta[file] = "added"
-		}
-	}
-	return delta
-}
-
-// generateDeltaHash creates a hash from the delta operations
-func (packager *Packager) generateDeltaHash(
-	deltaOperations map[string]string) string {
-
-	hasher := sha256.New()
-	keys := make([]string, len(deltaOperations))
-	for key := range deltaOperations {
-		keys = append(keys, key)
-	}
-	// maps are randomised at runtime by go, we need to
-	// order it to ensure the hashes are always the same for
-	// the same operations
-	sort.Strings(keys)
-	for _, key := range keys {
-		hasher.Write([]byte(deltaOperations[key]))
-	}
-	return fmt.Sprintf("%x", hasher.Sum(nil))
-}
-
-// createUpgradeDelta creates a new directory with the added and modified
-// files from the new download vs. the previous one
-func (packager *Packager) createUpgradeDelta(
-	delta map[string]string,
-	extractPath string,
-	upgradePackagePath string) (int, int64, error) {
-	var upgradeFileCount int
-	var byteCount int64
-	for filename, op := range delta {
-		if op == "added" || op == "modified" {
-			extractedFilePath := filepath.Join(extractPath, filename)
-			upgradedFilePath := filepath.Join(upgradePackagePath, filename)
-			info, err := os.Stat(extractedFilePath)
-			if err == nil {
-				err = os.MkdirAll(filepath.Dir(upgradedFilePath), 0744)
-				if err != nil {
-					return 0, 0, err
-				}
-				err = os.Rename(extractedFilePath, upgradedFilePath)
-				if err != nil {
-					return 0, 0, err
-				}
-				upgradeFileCount++
-				byteCount += info.Size()
-			}
-		} else {
-			log.WithFields(log.Fields{
-				"file": filename,
-				"op":   op,
-			}).Debug("File removed")
-		}
-	}
-	return upgradeFileCount, byteCount, nil
 }
