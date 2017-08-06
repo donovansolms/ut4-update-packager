@@ -20,6 +20,7 @@ run: build
 	PACKAGER_DATABASE_PASSWORD=root \
 	PACKAGER_WORKING_DIR="./temp/working" \
 	PACKAGER_RELEASE_DIR="./temp/releases" \
+	PACKAGER_PACKAGE_DIR="./temp/packages" \
 	./bin/${APP_NAME}
 
 # http://golang.org/cmd/go/#hdr-Run_gofmt_on_package_sources

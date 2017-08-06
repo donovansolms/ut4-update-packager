@@ -25,6 +25,12 @@
 			"revisionTime": "2017-07-15T19:24:08Z"
 		},
 		{
+			"checksumSHA1": "lOgwGRyD0kEBbfKyrzKGROYDPEw=",
+			"path": "github.com/jhoonb/archivex",
+			"revision": "be4efa7ec0c38ab76d56037014c90d48d6b13037",
+			"revisionTime": "2017-04-08T19:27:36Z"
+		},
+		{
 			"checksumSHA1": "xW2OR0GJzZRmTzgNlyzqI/FxEu0=",
 			"path": "github.com/jinzhu/gorm",
 			"revision": "5b8c0dd6b92d9caa8036c31dcb117f2df7cceefa",

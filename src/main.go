@@ -13,6 +13,7 @@ type Config struct {
 	ReleaseFeedURL   string `split_words:"true"`
 	ReleaseDir       string `split_words:"true"`
 	WorkingDir       string `split_words:"true"`
+	PackageDir       string `split_words:"true"`
 	DatabaseUser     string `split_words:"true"`
 	DatabasePassword string `split_words:"true"`
 	DatabaseName     string `split_words:"true"`
@@ -34,12 +35,16 @@ func main() {
 		config.DatabasePort,
 		config.DatabaseName,
 		"charset=utf8&parseTime=True")
-	packager := packager.New(
+	packager, err := packager.New(
 		config.ReleaseFeedURL,
 		connectionString,
 		config.WorkingDir,
 		config.ReleaseDir,
+		config.PackageDir,
 	)
+	if err != nil {
+		panic(err)
+	}
 
 	// TODO: Remove later
 	err = packager.Run()

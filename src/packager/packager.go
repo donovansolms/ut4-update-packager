@@ -13,12 +13,17 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/donovansolms/ut4-update-packager/src/packager/models"
+	"github.com/jhoonb/archivex"
 	"github.com/jinzhu/gorm"
 	"github.com/mmcdole/gofeed"
 	"github.com/mvdan/xurls"
 	log "github.com/sirupsen/logrus"
+
+	// This is how SQL drivers are imported
+	_ "github.com/go-sql-driver/mysql"
 )
 
 // Packager creates new update packages for releases
@@ -31,25 +36,41 @@ type Packager struct {
 	workingDir string
 	// releaseDir is where the releases are stored with their version numbers
 	releaseDir string
+	// packageDir is where compressed upgrade packages are stored
+	packageDir string
 }
 
 // New creates a new instance of Packager
 func New(releaseFeedURL string,
 	connectionString string,
 	workingDir string,
-	releaseDir string) *Packager {
+	releaseDir string,
+	packageDir string) (*Packager, error) {
 	log.SetOutput(os.Stdout)
 	log.SetLevel(log.DebugLevel)
 	log.SetFormatter(&log.TextFormatter{
 		FullTimestamp:   true,
 		TimestampFormat: "Jan 02 15:04:05",
 	})
+	err := os.MkdirAll(workingDir, 0755)
+	if err != nil {
+		return &Packager{}, err
+	}
+	err = os.MkdirAll(releaseDir, 0755)
+	if err != nil {
+		return &Packager{}, err
+	}
+	err = os.MkdirAll(packageDir, 0755)
+	if err != nil {
+		return &Packager{}, err
+	}
 	return &Packager{
 		releaseFeedURL:   releaseFeedURL,
 		connectionString: connectionString,
 		workingDir:       workingDir,
 		releaseDir:       releaseDir,
-	}
+		packageDir:       packageDir,
+	}, nil
 }
 
 // CheckForNewRelease checks if a new release has been announced on
@@ -209,6 +230,11 @@ func (packager *Packager) Run() error {
 	}
 	log.WithField("versions", versions).Info("Currently available versions")
 
+	db, err := gorm.Open("mysql", packager.connectionString)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
 	// Now we build an upgrade path for each version to the new version
 	// We do this so that you can upgrade from any verion we have listed
 	// to the new one. If we don't have a version listed, you'll download
@@ -220,13 +246,62 @@ func (packager *Packager) Run() error {
 				"toVersion":   newVersion}).Debug("Skipping older or equal version")
 			continue
 		}
+
+		// First check if this upgrade path has been added to the database already
+		var updateCheck models.Ut4UpdatePackages
+		query := db.Where("from_version = ? AND to_version = ? ANd is_deleted = 0",
+			version,
+			newVersion,
+		).First(&updateCheck)
+		if query.Error != nil {
+			if query.Error == gorm.ErrRecordNotFound {
+				// continue
+			} else {
+				return query.Error
+			}
+		}
+		if updateCheck.FromVersion != "" && updateCheck.ToVersion != "" {
+			// We have this version already
+			log.WithFields(log.Fields{
+				"fromVersion": version,
+				"toVersion":   newVersion,
+			}).Warning("Upgrade already processed")
+			continue
+		}
+
 		packagePath, err := packager.generateUpgradePath(version, newVersion)
 		if err != nil {
 			log.WithField("err", "generating_upgrade_path").Error(err.Error())
 		}
-		_ = packagePath
-	}
+		log.WithFields(log.Fields{
+			"fromVersion": version,
+			"toVersion":   newVersion,
+			"path":        packagePath,
+		}).Info("Upgrade package created")
 
+		// TODO: Package needs to be uploaded somewhere
+		err = os.Rename(
+			packagePath,
+			filepath.Join(packager.packageDir, filepath.Base(packagePath)))
+		if err != nil {
+			return err
+		}
+
+		updatePackage := models.Ut4UpdatePackages{
+			FromVersion: version,
+			ToVersion:   newVersion,
+			// TODO: Implement the update
+			UpdateURL:   "http://update.donovansolms.com/3301923-3395761.tar.gz",
+			DateCreated: time.Now(),
+		}
+		query = db.Save(&updatePackage)
+		if query.Error != nil {
+			return err
+		}
+
+	}
+	// Clear out the working dir, it will be recreated on startup
+	os.RemoveAll(packager.workingDir)
 	return nil
 }
 
@@ -275,7 +350,7 @@ func (packager *Packager) generateUpgradePath(
 			}
 			sourcePath := filepath.Join(packager.releaseDir, toVersion, filename)
 			destinationPath := filepath.Join(workingPackagePath, filename)
-			err := os.MkdirAll(filepath.Dir(destinationPath), 0755)
+			err = os.MkdirAll(filepath.Dir(destinationPath), 0755)
 			if err != nil {
 				return "", err
 			}
@@ -286,8 +361,37 @@ func (packager *Packager) generateUpgradePath(
 		}
 	}
 	// Write a copy of the delta operations to the package
+	deltaOperationsBytes, err := json.Marshal(&deltaOperations)
+	if err != nil {
+		if err != nil {
+			return "", err
+		}
+	}
+	err = ioutil.WriteFile(
+		filepath.Join(workingPackagePath, "operations.json"),
+		deltaOperationsBytes,
+		0644)
+	if err != nil {
+		return "", err
+	}
 
-	return "", nil
+	// Create the compressed package file
+	// I'm using archivex since it already does recursive compression of a
+	// directory...because I'm lazy
+	compressedPath := filepath.Join(
+		packager.workingDir, fmt.Sprintf("%s-%s.tar.gz", fromVersion, toVersion))
+	tar := new(archivex.TarFile)
+	err = tar.Create(compressedPath)
+	if err != nil {
+		return "", err
+	}
+	err = tar.AddAll(workingPackagePath, false)
+	if err != nil {
+		return "", err
+	}
+	tar.Close()
+
+	return compressedPath, nil
 }
 
 // fetchFeed fetches the content from the release feed
