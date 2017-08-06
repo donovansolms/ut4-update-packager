@@ -2,6 +2,7 @@ package packager
 
 import (
 	"archive/zip"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -169,17 +170,17 @@ func (packager *Packager) Run() error {
 	}).Info("New release is available")
 
 	// Get the new release
-	newReleasePath, err := packager.DownloadAndExtract(downloadURL)
+	newReleaseTempPath, err := packager.DownloadAndExtract(downloadURL)
 	if err != nil {
 		log.WithField("err", "download_extract").Error(err.Error())
 		return err
 	}
 	log.WithFields(log.Fields{
-		"output": newReleasePath,
+		"output": newReleaseTempPath,
 	}).Info("Release downloaded and extracted")
 
 	// Determine version
-	newVersion, err := packager.getReleaseNumber(newReleasePath)
+	newVersion, err := packager.getReleaseNumber(newReleaseTempPath)
 	if err != nil {
 		// TODO: Possibly check the download file name for the version number
 		// TODO: Send email with missing release number
@@ -188,6 +189,19 @@ func (packager *Packager) Run() error {
 	}
 	log.WithField("version", newVersion).Info("Version info found")
 
+	// Now that we have the new release's version, we can move the files
+	// there
+	newReleasePath := filepath.Join(packager.releaseDir, newVersion)
+	os.RemoveAll(newReleasePath)
+	err = os.Rename(
+		newReleaseTempPath,
+		newReleasePath)
+	if err != nil {
+		// TODO: Send email
+		log.WithField("err", "move_temp_to_release").Error(err.Error())
+		return err
+	}
+
 	versions, err := packager.GetVersionList()
 	if err != nil {
 		log.WithField("err", "version_list").Error(err.Error())
@@ -195,7 +209,85 @@ func (packager *Packager) Run() error {
 	}
 	log.WithField("versions", versions).Info("Currently available versions")
 
+	// Now we build an upgrade path for each version to the new version
+	// We do this so that you can upgrade from any verion we have listed
+	// to the new one. If we don't have a version listed, you'll download
+	// the full latest version
+	for _, version := range versions {
+		if version >= newVersion {
+			log.WithFields(log.Fields{
+				"fromVersion": version,
+				"toVersion":   newVersion}).Debug("Skipping older or equal version")
+			continue
+		}
+		packagePath, err := packager.generateUpgradePath(version, newVersion)
+		if err != nil {
+			log.WithField("err", "generating_upgrade_path").Error(err.Error())
+		}
+		_ = packagePath
+	}
+
 	return nil
+}
+
+// generateUpgradePath generates and upgrade package from
+// fromVersion to toVersion and returns the path to the upgrade package
+func (packager *Packager) generateUpgradePath(
+	fromVersion string,
+	toVersion string) (string, error) {
+	log.WithFields(log.Fields{
+		"from": fromVersion,
+		"to":   toVersion,
+	}).Info("Generating upgrade path")
+	if fromVersion == toVersion {
+		return "", errors.New("fromVersion and toVersion can't be the same")
+	}
+
+	fromVersionHashes, err := packager.getVersionHashes(fromVersion)
+	if err != nil {
+		return "", err
+	}
+	toVersionHashes, err := packager.getVersionHashes(toVersion)
+	if err != nil {
+		return "", err
+	}
+
+	deltaOperations := packager.calculateHashDeltaOperations(
+		fromVersionHashes,
+		toVersionHashes)
+
+	// For each file with the operation 'added' or 'modified' copy the file
+	// to the new path for packaging
+	// 'Removed' operations will be performed on the client using this delta file
+	workingPackagePath := filepath.Join(
+		packager.workingDir,
+		fmt.Sprintf("%s-package", toVersion))
+	for filename, operation := range deltaOperations {
+		if operation == deltaOperationAdded || operation == deltaOperationModified {
+
+			// We need to check if this is a pak file, if it is, we need to diff
+			// and package it separately to not require a full pak download that
+			// consists of multiple GBs of data
+			if strings.ToLower(filepath.Ext(filename)) == "pak" &&
+				operation == deltaOperationModified {
+				log.WithField("pak", filename).Debug("Pak file modified")
+				continue
+			}
+			sourcePath := filepath.Join(packager.releaseDir, toVersion, filename)
+			destinationPath := filepath.Join(workingPackagePath, filename)
+			err := os.MkdirAll(filepath.Dir(destinationPath), 0755)
+			if err != nil {
+				return "", err
+			}
+			err = CopyFile(sourcePath, destinationPath)
+			if err != nil {
+				return "", err
+			}
+		}
+	}
+	// Write a copy of the delta operations to the package
+
+	return "", nil
 }
 
 // fetchFeed fetches the content from the release feed
@@ -355,10 +447,150 @@ func (packager *Packager) getReleaseNumber(installPath string) (string, error) {
 	}
 	defer moduleFile.Close()
 
-	var module OldUT4Modules
+	var module UT4Modules
 	err = json.NewDecoder(moduleFile).Decode(&module)
 	if err != nil {
 		return "", err
 	}
 	return strconv.Itoa(module.Changelist), nil
+}
+
+// getVersionHashes gets the version's hashes or generates them if
+// they don't exist
+func (packager *Packager) getVersionHashes(
+	version string) (map[string]string, error) {
+	hashes := make(map[string]string)
+
+	versionPath := filepath.Join(packager.releaseDir, version)
+	versionHashPath := filepath.Join(
+		packager.releaseDir,
+		fmt.Sprintf("%s.hashes", version))
+	hashFile, err := ioutil.ReadFile(versionHashPath)
+	if err != nil {
+		log.WithField("version", version).Debug("No hash file exist, generate")
+		// Hash file doesn't exist or we couldn't read it
+		hashes, err = packager.generateHashes(versionPath)
+		if err != nil {
+			return hashes, err
+		}
+		// Save the cached copy
+		var hashJSON []byte
+		hashJSON, err = json.Marshal(&hashes)
+		if err != nil {
+			// Don't worry about the error here, just return the hashes then
+			return hashes, nil
+		}
+		// Ignore the error here, if it fails we'll just try next time
+		_ = ioutil.WriteFile(versionHashPath, hashJSON, 0644)
+		return hashes, nil
+	}
+	err = json.Unmarshal(hashFile, &hashes)
+	if err != nil {
+		return hashes, err
+	}
+	return hashes, nil
+}
+
+// generateHashes generates SHA256 hashes for all the
+// files in the given searchPath
+func (packager *Packager) generateHashes(
+	searchPath string) (map[string]string, error) {
+
+	hashes := make(map[string]string)
+	var fileList []string
+	err := filepath.Walk(
+		searchPath,
+		func(path string, fileInfo os.FileInfo, err error) error {
+			if fileInfo.IsDir() == false {
+				fileList = append(fileList, path)
+			}
+			return nil
+		})
+	if err != nil {
+		return hashes, err
+	}
+
+	// Queue jobs!
+	for _, filepath := range fileList {
+		fileInfo, err := os.Stat(filepath)
+		if err != nil {
+			return hashes, err
+		}
+		usePath := strings.Replace(filepath, searchPath+"/", "", -1)
+		if fileInfo.Size() == 0 {
+			// HACK: return this hash for a zero-byte file, writer won't write any
+			// bytes, no hash generated. Fix sometime.
+			hashes[usePath] = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+			continue
+		}
+		file, err := os.Open(filepath)
+		if err != nil {
+			return hashes, err
+		}
+		defer file.Close()
+		// Set up an internal hash progress tracker
+		hasher := sha256.New()
+		_, err = io.Copy(hasher, file)
+		if err != nil {
+			return hashes, err
+		}
+		hashes[usePath] = fmt.Sprintf("%x", hasher.Sum(nil))
+	}
+	return hashes, nil
+}
+
+// calculateHashDeltaOperations calculates the operations to be performed
+// between two versions
+func (packager *Packager) calculateHashDeltaOperations(
+	fromVersionHashes map[string]string,
+	toVersionHashes map[string]string) map[string]string {
+
+	// This will determine what needs to be done to current
+	// Modified, Removed will be done first,
+	// Added in pass 2
+	delta := make(map[string]string)
+	for file, hash := range fromVersionHashes {
+		if nextHash, ok := toVersionHashes[file]; ok {
+			if nextHash != hash {
+				// File has been modified
+				delta[file] = deltaOperationModified
+			}
+		} else {
+			// File has been removed
+			delta[file] = deltaOperationRemoved
+		}
+	}
+	for file := range toVersionHashes {
+		if _, ok := fromVersionHashes[file]; !ok {
+			delta[file] = deltaOperationAdded
+		}
+	}
+	return delta
+}
+
+// CopyFile copies a file from source to destination and preserves permissions
+// This functions has been taken from
+// https://www.socketloop.com/tutorials/golang-copy-directory-including-sub-directories-files
+// with slight modifications because I am too lazy to build my own
+func CopyFile(source string, dest string) (err error) {
+	sourcefile, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer sourcefile.Close()
+
+	destfile, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	defer destfile.Close()
+
+	_, err = io.Copy(destfile, sourcefile)
+	if err == nil {
+		sourceinfo, err := os.Stat(source)
+		if err != nil {
+			os.Chmod(dest, sourceinfo.Mode())
+		}
+	}
+	return
 }
