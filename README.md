@@ -1,3 +1,5 @@
+*This project is incomplete and has been abandoned*
+
 # Unreal Tournament 4 Incremental Update Packager
 
 The Unreal Tournament 4 update packager for Linux
